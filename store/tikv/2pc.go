@@ -346,9 +346,18 @@ func (c *twoPhaseCommitter) keySize(key []byte) int {
 }
 
 func (c *twoPhaseCommitter) buildPrewriteRequest(batch batchKeys) *tikvrpc.Request {
-	var req *pb.PrewriteRequest
-	// YOUR CODE HERE (proj6).
-	panic("YOUR CODE HERE")
+	var mutations []*pb.Mutation
+	for _, key := range batch.keys {
+		if m, ok := c.mutations[string(key)]; ok {
+			mutations = append(mutations, &m.Mutation)
+		}
+	}
+	req := &pb.PrewriteRequest{
+		Mutations:    mutations,
+		PrimaryLock:  c.primaryKey,
+		StartVersion: c.startTS,
+		LockTtl:      c.lockTTL,
+	}
 	return tikvrpc.NewRequest(tikvrpc.CmdPrewrite, req, pb.Context{})
 }
 
@@ -419,11 +428,14 @@ func (c *twoPhaseCommitter) getUndeterminedErr() error {
 
 func (actionCommit) handleSingleBatch(c *twoPhaseCommitter, bo *Backoffer, batch batchKeys) error {
 	// follow actionPrewrite.handleSingleBatch, build the commit request
-	var sender *RegionRequestSender
-	var err error
-	// build and send the commit request
-	// YOUR CODE HERE (proj6).
-	panic("YOUR CODE HERE")
+	req := tikvrpc.NewRequest(tikvrpc.CmdCommit, &pb.CommitRequest{
+		StartVersion:  c.startTS,
+		Keys:          batch.keys,
+		CommitVersion: c.commitTS,
+	}, pb.Context{})
+
+	sender := NewRegionRequestSender(c.store.regionCache, c.store.client)
+	resp, err := sender.SendReq(bo, req, batch.region, readTimeoutShort)
 
 	// If we fail to receive response for the request that commits primary key, it will be undetermined whether this
 	// transaction has been successfully committed.
@@ -445,8 +457,29 @@ func (actionCommit) handleSingleBatch(c *twoPhaseCommitter, bo *Backoffer, batch
 	}
 
 	// handle the response and error refer to actionPrewrite.handleSingleBatch
-	// YOUR CODE HERE (proj6).
-	panic("YOUR CODE HERE")
+	regionErr, err := resp.GetRegionError()
+	if err != nil {
+		return errors.Trace(err)
+	}
+	if regionErr != nil {
+		err = bo.Backoff(BoRegionMiss, errors.New(regionErr.String()))
+		if err != nil {
+			return errors.Trace(err)
+		}
+		// Retry with new region
+		return c.commitKeys(bo, batch.keys)
+	}
+	if resp.Resp == nil {
+		return errors.Trace(ErrBodyMissing)
+	}
+	commitResp := resp.Resp.(*pb.CommitResponse)
+	if keyErr := commitResp.GetError(); keyErr != nil {
+		err = extractKeyErr(keyErr)
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		c.mu.committed = false
+		return errors.Trace(err)
+	}
 
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -458,14 +491,41 @@ func (actionCommit) handleSingleBatch(c *twoPhaseCommitter, bo *Backoffer, batch
 
 func (actionCleanup) handleSingleBatch(c *twoPhaseCommitter, bo *Backoffer, batch batchKeys) error {
 	// follow actionPrewrite.handleSingleBatch, build the rollback request
+	req := tikvrpc.NewRequest(tikvrpc.CmdBatchRollback, &pb.BatchRollbackRequest{
+		StartVersion: c.startTS,
+		Keys:         batch.keys,
+	}, pb.Context{})
 
 	// build and send the rollback request
-	// YOUR CODE HERE (proj6).
-	panic("YOUR CODE HERE")
-	// handle the response and error refer to actionPrewrite.handleSingleBatch
+	resp, err := c.store.SendReq(bo, req, batch.region, readTimeoutShort)
+	if err != nil {
+		return errors.Trace(err)
+	}
 
-	// YOUR CODE HERE (proj6).
-	panic("YOUR CODE HERE")
+	// handle the response and error refer to actionPrewrite.handleSingleBatch
+	regionErr, err := resp.GetRegionError()
+	if err != nil {
+		return errors.Trace(err)
+	}
+	if regionErr != nil {
+		err = bo.Backoff(BoRegionMiss, errors.New(regionErr.String()))
+		if err != nil {
+			return errors.Trace(err)
+		}
+		return c.cleanupKeys(bo, batch.keys)
+	}
+	if resp.Resp == nil {
+		return errors.Trace(ErrBodyMissing)
+	}
+	rollbackResp := resp.Resp.(*pb.BatchRollbackResponse)
+	if keyErr := rollbackResp.GetError(); keyErr != nil {
+		err = extractKeyErr(keyErr)
+		logutil.BgLogger().Debug("2PC cleanup failed",
+			zap.Uint64("conn", c.connID),
+			zap.Uint64("txnStartTS", c.startTS),
+			zap.Error(err))
+		return errors.Trace(err)
+	}
 	return nil
 
 }

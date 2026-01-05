@@ -14,7 +14,6 @@
 package core
 
 import (
-	"github.com/pingcap/errors"
 	"github.com/pingcap/tidb/expression"
 	"github.com/pingcap/tidb/parser/ast"
 )
@@ -36,15 +35,214 @@ type joinGroupNonEqEdge struct {
 }
 
 func (s *joinReorderDPSolver) solve(joinGroup []LogicalPlan, eqConds []expression.Expression) (LogicalPlan, error) {
-	// TODO: You need to implement the join reorder algo based on DP.
+	n := len(joinGroup)
+	if n == 0 {
+		return nil, nil
+	}
+	if n == 1 {
+		return joinGroup[0], nil
+	}
 
-	// The pseudo code can be found in README.
-	// And there's some common struct and method like `baseNodeCumCost`, `calcJoinCumCost` you can use in `rule_join_reorder.go`.
-	// Also, you can take a look at `rule_join_reorder_greedy.go`, this file implement the join reorder algo based on greedy algorithm.
-	// You'll see some common usages in the greedy version.
+	// Derive stats for each node
+	for _, node := range joinGroup {
+		_, err := node.recursiveDeriveStats()
+		if err != nil {
+			return nil, err
+		}
+	}
 
-	// Note that the join tree may be disconnected. i.e. You need to consider the case `select * from t, t1, t2`.
-	return nil, errors.Errorf("unimplemented")
+	// Build edge information from eqConds
+	eqEdges := make([]joinGroupEqEdge, 0, len(eqConds))
+	for _, cond := range eqConds {
+		sf := cond.(*expression.ScalarFunction)
+		lCol := sf.GetArgs()[0].(*expression.Column)
+		rCol := sf.GetArgs()[1].(*expression.Column)
+		lIdx, err := findNodeIndexInGroup(joinGroup, lCol)
+		if err != nil {
+			return nil, err
+		}
+		rIdx, err := findNodeIndexInGroup(joinGroup, rCol)
+		if err != nil {
+			return nil, err
+		}
+		eqEdges = append(eqEdges, joinGroupEqEdge{
+			nodeIDs: []int{lIdx, rIdx},
+			edge:    sf,
+		})
+	}
+
+	// Build non-eq edge information from otherConds
+	nonEqEdges := make([]joinGroupNonEqEdge, 0, len(s.otherConds))
+	for _, cond := range s.otherConds {
+		cols := expression.ExtractColumns(cond)
+		mask := uint(0)
+		nodeIDs := make([]int, 0)
+		for _, col := range cols {
+			idx, err := findNodeIndexInGroup(joinGroup, col)
+			if err != nil {
+				return nil, err
+			}
+			if mask&(1<<uint(idx)) == 0 {
+				mask |= 1 << uint(idx)
+				nodeIDs = append(nodeIDs, idx)
+			}
+		}
+		nonEqEdges = append(nonEqEdges, joinGroupNonEqEdge{
+			nodeIDs:    nodeIDs,
+			nodeIDMask: mask,
+			expr:       cond,
+		})
+	}
+
+	// DP arrays
+	totalMask := uint(1<<n) - 1
+	bestPlan := make([]LogicalPlan, 1<<n)
+	bestCost := make([]float64, 1<<n)
+
+	// Initialize: all invalid
+	for i := range bestCost {
+		bestCost[i] = -1
+	}
+
+	// Initialize single nodes
+	for i := 0; i < n; i++ {
+		mask := uint(1 << i)
+		bestPlan[mask] = joinGroup[i]
+		bestCost[mask] = s.baseNodeCumCost(joinGroup[i])
+	}
+
+	// DP: enumerate all subsets
+	for mask := uint(1); mask <= totalMask; mask++ {
+		if bestCost[mask] >= 0 {
+			// Already computed (single node)
+			continue
+		}
+
+		// Try all non-empty proper subsets of mask
+		// sub is a subset of mask, and mask ^ sub is the complement in mask
+		for sub := mask & (mask - 1); sub > 0; sub = (sub - 1) & mask {
+			comp := mask ^ sub
+			if bestCost[sub] < 0 || bestCost[comp] < 0 {
+				// One of the subgroups is not computed yet, skip
+				continue
+			}
+
+			// Find edges connecting sub and comp
+			var usedEqEdges []joinGroupEqEdge
+			for _, edge := range eqEdges {
+				idx1, idx2 := edge.nodeIDs[0], edge.nodeIDs[1]
+				m1, m2 := uint(1<<idx1), uint(1<<idx2)
+				// Check if this edge connects sub and comp
+				if (sub&m1 != 0 && comp&m2 != 0) || (sub&m2 != 0 && comp&m1 != 0) {
+					usedEqEdges = append(usedEqEdges, edge)
+				}
+			}
+
+			// If no edge connects them, skip (handle cartesian later)
+			if len(usedEqEdges) == 0 {
+				continue
+			}
+
+			// Find other conditions that can be applied
+			var usedOtherConds []expression.Expression
+			for _, edge := range nonEqEdges {
+				if edge.nodeIDMask&mask == edge.nodeIDMask {
+					// All nodes of this condition are in the mask
+					usedOtherConds = append(usedOtherConds, edge.expr)
+				}
+			}
+
+			// Make the join - put smaller subset on left, larger on right for consistent ordering
+			// When popCount is equal, use smaller mask (lower node indices) on left
+			leftPlan, rightPlan := bestPlan[sub], bestPlan[comp]
+			leftCost, rightCost := bestCost[sub], bestCost[comp]
+			leftMask, rightMask := sub, comp
+			subPC, compPC := popCount(sub), popCount(comp)
+			if subPC > compPC || (subPC == compPC && sub > comp) {
+				leftPlan, rightPlan = rightPlan, leftPlan
+				leftCost, rightCost = rightCost, leftCost
+				leftMask, rightMask = rightMask, leftMask
+			}
+
+			// Reorder edges to match the left/right assignment
+			var orderedEqEdges []joinGroupEqEdge
+			for _, edge := range usedEqEdges {
+				idx1, idx2 := edge.nodeIDs[0], edge.nodeIDs[1]
+				m1, m2 := uint(1<<idx1), uint(1<<idx2)
+				// Ensure the edge goes from left to right
+				if leftMask&m1 != 0 && rightMask&m2 != 0 {
+					orderedEqEdges = append(orderedEqEdges, edge)
+				} else if leftMask&m2 != 0 && rightMask&m1 != 0 {
+					// Swap the columns in the edge
+					newSf := expression.NewFunctionInternal(s.ctx, ast.EQ, edge.edge.GetType(),
+						edge.edge.GetArgs()[1], edge.edge.GetArgs()[0]).(*expression.ScalarFunction)
+					orderedEqEdges = append(orderedEqEdges, joinGroupEqEdge{
+						nodeIDs: []int{idx2, idx1},
+						edge:    newSf,
+					})
+				}
+			}
+
+			newJoin, err := s.newJoinWithEdge(leftPlan, rightPlan, orderedEqEdges, usedOtherConds)
+			if err != nil {
+				return nil, err
+			}
+
+			// Calculate cost
+			leftNode := &jrNode{p: leftPlan, cumCost: leftCost}
+			rightNode := &jrNode{p: rightPlan, cumCost: rightCost}
+			newCost := s.calcJoinCumCost(newJoin, leftNode, rightNode)
+
+			// Update if better
+			if bestCost[mask] < 0 || newCost < bestCost[mask] {
+				bestCost[mask] = newCost
+				bestPlan[mask] = newJoin
+			}
+		}
+	}
+
+	// If the graph is connected, bestPlan[totalMask] should be set
+	if bestPlan[totalMask] != nil {
+		return bestPlan[totalMask], nil
+	}
+
+	// Handle disconnected graph: collect all connected components and make bushy join
+	// First, identify all connected components by finding maximal valid groups
+	var cartesianGroup []LogicalPlan
+	remaining := totalMask
+
+	// Process nodes in order to maintain deterministic output
+	for i := 0; i < n && remaining > 0; i++ {
+		nodeMask := uint(1 << i)
+		if remaining&nodeMask == 0 {
+			continue
+		}
+
+		// Find the largest connected component starting from this node
+		var bestMask uint = nodeMask
+		for mask := remaining; mask > 0; mask = (mask - 1) & remaining {
+			if mask&nodeMask == 0 {
+				continue
+			}
+			if bestPlan[mask] != nil && popCount(mask) > popCount(bestMask) {
+				bestMask = mask
+			}
+		}
+
+		cartesianGroup = append(cartesianGroup, bestPlan[bestMask])
+		remaining &^= bestMask
+	}
+
+	return s.makeBushyJoin(cartesianGroup, s.otherConds), nil
+}
+
+func popCount(x uint) int {
+	count := 0
+	for x > 0 {
+		count++
+		x &= x - 1
+	}
+	return count
 }
 
 func (s *joinReorderDPSolver) newJoinWithEdge(leftPlan, rightPlan LogicalPlan, edges []joinGroupEqEdge, otherConds []expression.Expression) (LogicalPlan, error) {

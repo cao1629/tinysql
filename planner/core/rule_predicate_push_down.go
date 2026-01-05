@@ -352,21 +352,53 @@ func (p *LogicalProjection) PredicatePushDown(predicates []expression.Expression
 }
 
 // PredicatePushDown implements LogicalPlan PredicatePushDown interface.
-// TODO: project 4-1 your code here.
-// Here you need to push the predicates across the aggregation.
+// Here we push the predicates across the aggregation.
 // A simple example is that `select * from (select count(*) from t group by b) tmp_t where b > 1` is the same with
 // `select * from (select count(*) from t where b > 1 group by b) tmp_t.
-// parameters:
-//   predicates: an expression slice which needs to be pushed down as deeply as possible.
-// return values:
-//   ret:     the expressions that can't be pushed.
-//   retPlan: a plan that represents a new root, because it might change the root if the having clause exists
-// In this function, you need to iterate through list `predicates`, and consider whether each function in it can be pushed down
-// below the current aggregation.
-// Hints:
-//   1. predicates need to be discussed in two types: expression.Constant and expression.ScalarFunction
 func (la *LogicalAggregation) PredicatePushDown(predicates []expression.Expression) (ret []expression.Expression, retPlan LogicalPlan) {
-	return predicates, la
+	var condsToPush []expression.Expression
+	var condsToRemain []expression.Expression
+
+	// Get GROUP BY columns - predicates referencing only these columns can be pushed
+	groupByCols := la.GetGroupByCols()
+	groupByColsSet := make(map[int64]struct{}, len(groupByCols))
+	for _, col := range groupByCols {
+		groupByColsSet[col.UniqueID] = struct{}{}
+	}
+
+	for _, cond := range predicates {
+		switch cond.(type) {
+		case *expression.Constant:
+			// Constants can be pushed down
+			condsToPush = append(condsToPush, cond)
+		case *expression.ScalarFunction:
+			// Extract all columns from the predicate
+			cols := expression.ExtractColumns(cond)
+			canPush := len(cols) > 0
+
+			// Check if all columns are from GROUP BY columns
+			for _, col := range cols {
+				if _, ok := groupByColsSet[col.UniqueID]; !ok {
+					canPush = false
+					break
+				}
+			}
+
+			if canPush {
+				condsToPush = append(condsToPush, cond)
+			} else {
+				condsToRemain = append(condsToRemain, cond)
+			}
+		default:
+			condsToRemain = append(condsToRemain, cond)
+		}
+	}
+
+	// Push conditions to children
+	retConds, child := la.children[0].PredicatePushDown(condsToPush)
+	addSelection(la, child, retConds, 0)
+
+	return condsToRemain, la
 }
 
 // PredicatePushDown implements LogicalPlan PredicatePushDown interface.

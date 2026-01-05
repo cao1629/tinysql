@@ -210,9 +210,72 @@ type candidatePath struct {
 // (3): does it require a double scan.
 // If `x` is not worse than `y` at all factors,
 // and there exists one factor that `x` is better than `y`, then `x` is better than `y`.
+// Return values:
+//   1: lhs is better than rhs
+//  -1: rhs is better than lhs
+//   0: neither is strictly better
 func compareCandidates(lhs, rhs *candidatePath) int {
-	// Project 4-2: your code here
-	// TODO: implement the content according to the header comment.
+	// Compare on three dimensions
+	// For each dimension:
+	//   1 means lhs is better
+	//  -1 means rhs is better
+	//   0 means equal
+
+	// Dimension 1: column set comparison
+	// A larger column set is better (more conditions pushed down)
+	var colCmp int
+	lhsColsSubset := lhs.columnSet.SubsetOf(rhs.columnSet)
+	rhsColsSubset := rhs.columnSet.SubsetOf(lhs.columnSet)
+	if lhsColsSubset && rhsColsSubset {
+		// Equal sets
+		colCmp = 0
+	} else if rhsColsSubset {
+		// lhs is a superset of rhs, lhs is better
+		colCmp = 1
+	} else if lhsColsSubset {
+		// rhs is a superset of lhs, rhs is better
+		colCmp = -1
+	} else {
+		// Neither is a subset of the other, incomparable
+		return 0
+	}
+
+	// Dimension 2: match property comparison
+	// Matching property is better
+	var propCmp int
+	if lhs.isMatchProp == rhs.isMatchProp {
+		propCmp = 0
+	} else if lhs.isMatchProp {
+		propCmp = 1
+	} else {
+		propCmp = -1
+	}
+
+	// Dimension 3: single scan vs double scan
+	// Single scan is better (no need to go back to table)
+	var scanCmp int
+	if lhs.isSingleScan == rhs.isSingleScan {
+		scanCmp = 0
+	} else if lhs.isSingleScan {
+		scanCmp = 1
+	} else {
+		scanCmp = -1
+	}
+
+	// Check if lhs dominates rhs (lhs is not worse on any dimension and better on at least one)
+	lhsBetterOnAny := colCmp > 0 || propCmp > 0 || scanCmp > 0
+	lhsNotWorseOnAll := colCmp >= 0 && propCmp >= 0 && scanCmp >= 0
+
+	// Check if rhs dominates lhs
+	rhsBetterOnAny := colCmp < 0 || propCmp < 0 || scanCmp < 0
+	rhsNotWorseOnAll := colCmp <= 0 && propCmp <= 0 && scanCmp <= 0
+
+	if lhsNotWorseOnAll && lhsBetterOnAny {
+		return 1
+	}
+	if rhsNotWorseOnAll && rhsBetterOnAny {
+		return -1
+	}
 	return 0
 }
 
@@ -273,11 +336,23 @@ func (ds *DataSource) skylinePruning(prop *property.PhysicalProperty) []*candida
 			}
 		}
 
-		// Project 4-2: your code here
-		// TODO: Here is the pruning phase. Will prune the access path which is must worse than others.
-		//       You'll need to implement the content in function `compareCandidates`.
-		//       And use it to prune unnecessary paths.
-		candidates = append(candidates, currentCandidate)
+		// Skyline pruning: prune the access path which is strictly worse than others.
+		// Check if currentCandidate is dominated by any existing candidate
+		pruned := false
+		for i := len(candidates) - 1; i >= 0; i-- {
+			cmp := compareCandidates(candidates[i], currentCandidate)
+			if cmp > 0 {
+				// Existing candidate is better, prune currentCandidate
+				pruned = true
+				break
+			} else if cmp < 0 {
+				// currentCandidate is better, remove the existing candidate
+				candidates = append(candidates[:i], candidates[i+1:]...)
+			}
+		}
+		if !pruned {
+			candidates = append(candidates, currentCandidate)
+		}
 	}
 	return candidates
 }

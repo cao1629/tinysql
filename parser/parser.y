@@ -3809,16 +3809,14 @@ JoinTable:
 	{
 		$$ = &ast.Join{Left: $1.(ast.ResultSetNode), Right: $3.(ast.ResultSetNode), Tp: ast.CrossJoin}
 	}
-	/* Project 2: your code here.
-	 * You can see details about JoinTable in https://dev.mysql.com/doc/refman/8.0/en/join.html
-	 *
-	 * joined_table: {
-         *     table_reference {[INNER | CROSS] JOIN | STRAIGHT_JOIN} table_factor [join_specification]
-         *   | table_reference {LEFT|RIGHT} [OUTER] JOIN table_reference join_specification
-         *   | table_reference NATURAL [INNER | {LEFT|RIGHT} [OUTER]] JOIN table_factor
-         * }
-         *
-	 */
+|	TableRef CrossOpt TableRef "ON" Expression %prec tableRefPriority
+	{
+		$$ = &ast.Join{Left: $1.(ast.ResultSetNode), Right: $3.(ast.ResultSetNode), Tp: ast.CrossJoin, On: &ast.OnCondition{Expr: $5.(ast.ExprNode)}}
+	}
+|	TableRef JoinType OuterOpt "JOIN" TableRef "ON" Expression %prec tableRefPriority
+	{
+		$$ = &ast.Join{Left: $1.(ast.ResultSetNode), Right: $5.(ast.ResultSetNode), Tp: $2.(ast.JoinType), On: &ast.OnCondition{Expr: $7.(ast.ExprNode)}}
+	}
 
 JoinType:
 	"LEFT"
